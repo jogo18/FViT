@@ -1,0 +1,6 @@
+deepspeed_sharding: false
+downstream_model_type: !!python/name:transformers.models.auto.modeling_auto.AutoModelForCausalLM ''
+load_weights: true
+pipeline_kwargs: null
+pretrained_model_name_or_path: gpt2
+tokenizer: null
