@@ -3,6 +3,7 @@ import flax.linen as nn
 import jax.numpy as jnp
 from typing import Callable
 
+
 class FourierTransformLayer(nn.Module):
     @nn.compact
     def __call__(self, x):
@@ -24,6 +25,7 @@ class FeedForwardLayer(nn.Module):
                      kernel_init=nn.initializers.normal(2e-2),
                      name="output")(x)
         return nn.Dropout(self.dropout_rate)(x, deterministic)
+
 
 class FNetEncoderBlock(nn.Module):
     fourier_layer: FourierTransformLayer

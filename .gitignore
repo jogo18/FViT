@@ -14,7 +14,7 @@ eggs/
 *.egg
 
 # Virtual environment
-venv/
+.venv/
 .env/
 
 # IDE files
