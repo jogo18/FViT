@@ -20,6 +20,7 @@ from typing import Optional
 from timm.models import vision_transformer
 from timm.models.vision_transformer import LayerScale, DropPath
 from timm.layers import Mlp
+from transformers import ViTImageProcessor
 
 
 class FNetBlock(nn.Module):
@@ -89,55 +90,51 @@ class FViTBlock(nn.Module):
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
-# Define Dataset
 
+class SpeechCommandsDataModule(pl.LightningDataModule):
+    def __init__(self, batch_size):
+        super().__init__()
+        self.dataset = None
+        self.transform = nn.Sequential(
+            transforms.Spectrogram()
+        )
+        self.Speech_Commands_train = None
+        self.Speech_Commands_val = None
+        self.Speech_Commands_test = None
+        self.batch_size = batch_size
 
-Speech_Commands_Dataset = ds.load_dataset('speech_commands', 'v0.02')
-classes = 34
+    # def prepare_data(self):
+    #     # download data
+    #     self.dataset = ds.load_dataset(
+    #         'speech_commands', 'v0.02')
+    #     self.classes = 34
 
+    #     processor = ViTImageProcessor()
+    #     audio = batch["audio"]
+    #     batch["input_values"] = processor(
+    #         audio["array"], sampling_rate=audio["sampling_rate"]).input_values[-1]
+    #     batch["input_length"] = len(batch["input_values"])
+    #     with processor.as_target_processor():
+    #         batch["labels"] = processor(batch["sentence"]).input_ids
+    #     return batch
 
-# various parameters
+    def setup(self, stage: str):
+        # Assign train/val datasets for use in dataloaders
+        self.Speech_Commands_train = self.dataset['train']
+        self.Speech_Commands_val = self.dataset['validation']
+        self.Speech_Commands_test = self.dataset['test']
 
-logparams = {
-    'img_size': [32, 1025],
-    'patch_size': [2, 41],
-    'exp_name': 'Jakob Fourier Project Test',  # unique name for model and logs
-    # sampling rate
-    'sampling_rate': Speech_Commands_Dataset['train'][0]['audio']['sampling_rate'],
-    'n_outputs': classes,
-    'wandb_project': 'FourierViT',
-    'gpus': 1,  # number of gpus
-    'max_epochs': 1,  # number of times during training, where the whole dataset is traversed
-    'learning_rate': 1e-3,
-    'batch_size': 1,  # should be considered together with learning rate. decrease if using a small machine and getting memory errors
-    'n_workers': 2,  # set to 0 in windows when working with a windows on a small machine
-}
+    def train_dataloader(self):
+        return DataLoader(self.Speech_Commands_train, batch_size=self.batch_size)
 
-hparams = Namespace(**logparams)
+    def val_dataloader(self):
+        return DataLoader(self.Speech_Commands_val, batch_size=self.batch_size)
 
+    def test_dataloader(self):
+        return DataLoader(self.Speech_Commands_test, batch_size=self.batch_size)
 
-train_data = DataLoader(
-    Speech_Commands_Dataset['train'],
-    hparams.batch_size,
-    shuffle=True,
-    num_workers=1
-)
-
-
-testdata = next(iter(train_data))
-print(testdata)
-
-testdata = testdata['audio']['array']
-testdata = np.array(testdata)
-print(testdata.shape)
-
-# testdata = torch.tensor(testdata)
-
-D = librosa.stft(testdata)
-S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
-S_db2 = np.squeeze(S_db.T)
-
-print(S_db2.shape)
+    # def predict_dataloader(self):
+    #     return DataLoader(self.Speech_Commands_predict, batch_size=32)
 
 
 class LitModel(pl.LightningModule):
@@ -147,6 +144,7 @@ class LitModel(pl.LightningModule):
             img_size=hparams.img_size,
             patch_size=hparams.patch_size,
             in_channels=1,
+            num_classes=hparams.n_outputs,
             qkv_bias=False,
             block_fn=FViTBlock
         )
@@ -204,55 +202,73 @@ class LitModel(pl.LightningModule):
         return optimizer
 
 
-# def main():
-#     #set random seed
-#     pl.seed_everything(1)
+def main():
 
-#     #define transforms for augmentation
-#     if hparams.transformtype == 1:
-#         train_transforms = transforms.Compose([
-#             transforms.ToTensor()
-#         ]
-#         )
+    # various hyperparameters
+    logparams = {
+        'img_size': [257, 63],
+        'patch_size': [16, 7],
+        'exp_name': 'Jakob Fourier Project Test',  # unique name for model and logs
+        # sampling rate
+        'sampling_rate': 16000,  # 16000 for SpeechCommands
+        'n_outputs': 34,  # 34 for SpeechCommands
+        'wandb_project': 'FourierViT',
+        'gpus': 1,  # number of gpus
+        'max_epochs': 1,  # number of times during training, where the whole dataset is traversed
+        'learning_rate': 1e-3,
+        'batch_size': 1,  # should be considered together with learning rate. decrease if using a small machine and getting memory errors
+        'n_workers': 4,  # set to 0 in windows when working with a windows on a small machine
+    }
+    hparams = Namespace(**logparams)
+    # set random seed
+    # pl.seed_everything(1)
+    dm = SpeechCommandsDataModule(batch_size=1)
+    temp2 = dm.prepare_data()
+    temp = dm.setup(stage='fit')
+    test = dm.train_dataloader()
+    test2 = next(iter(test))
+    print(test2['input_values'])
+    # print(test2)
+    # modeltest = vision_transformer.VisionTransformer(
+    #     img_size=hparams.img_size,
+    #     patch_size=hparams.patch_size,
+    #     in_chans=1,
+    #     num_classes=hparams.n_outputs,
+    #     qkv_bias=False,
+    #     block_fn=FViTBlock
+    # )
+    # asd = modeltest(test2['audio']['array'])
+    # print(asd)
+    # define logger and model
+    # wandb_logger = WandbLogger(
+    #     project=hparams.wandb_project,
+    #     log_model="all",
+    #     name=hparams.exp_name,
+    #     config=logparams
+    # )
 
-#     # define dataset
-#     dataset = Dataset(
-#         audio_list=data['path'],
-#         labels=labels,
-#         transforms=train_transforms
-#     )
+    # lightmodule = LitModel(hparams)
 
-#     train_dataset = 0
-#     val_dataset = 0
-#     test_dataset = 0
+# Define Trainer
+    # trainer = pl.Trainer(
+    #     max_epochs=hparams.max_epochs,
+    #     accelerator="gpu",
+    #     devices="auto",
+    #     logger=wandb_logger,
+    # )
 
-#     # Dataloaders for training and validation
-#     train_load = DataLoader(train_dataset, hparams.batch_size, shuffle = True, num_workers = 4)
-#     val_load = DataLoader(val_dataset, hparams.batch_size, shuffle = False, num_workers = 4)
-#     test_load = DataLoader(test_dataset, hparams.batch_size, shuffle = False, num_workers = 4)
+    # trainer.fit(
+    #     model=lightmodule,
+    #     datamodule=dm
+    # )
 
+    # trainer.test(
+    #     model=lightningtest,
+    #     dataloaders=test_load
+    # )
 
-#     # define logger and model
-#     wandb_logger = WandbLogger(
-#         project=hparams.wandb_project,
-#         log_model="all",
-#         name = hparams.exp_name,
-#         config = logparams
-#         )
-
-#     lightningtest = LitModel(hparams)
-
-# #Define Trainer
-#     trainer = pl.Trainer(
-#         limit_train_batches= len(train_dataset)//hparams.batch_size,
-#         max_epochs=hparams.max_epochs,
-#         accelerator="gpu",
-#         devices="auto",
-#         logger=wandb_logger,
-#     )
+    # wandb.finish()
 
 
-#     wandb.finish()
-
-# if __name__ == '__main__':
-#     main()
+if __name__ == '__main__':
+    main()
