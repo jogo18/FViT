@@ -1,0 +1,279 @@
+import torch
+import torch.nn as nn
+import torchaudio
+import matplotlib.pyplot as plt
+import pandas as pd
+import os
+import torch.nn.functional as F
+import wandb
+import pytorch_lightning as pl
+import datasets as ds
+import librosa
+import numpy as np
+import collections
+
+from torchvision.datasets import DatasetFolder
+from torchaudio import transforms
+from torchmetrics import Accuracy
+from torch.utils.data import Dataset, DataLoader
+from argparse import Namespace
+from pytorch_lightning.loggers import WandbLogger
+from typing import Optional
+from timm.models import vision_transformer
+from timm.models.vision_transformer import LayerScale, DropPath
+from timm.layers import Mlp
+from transformers import ViTImageProcessor
+from audio_utils.common.feature_transforms import SpectrogramParser
+
+
+class FNetBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        x = torch.fft.fft(torch.fft.fft(x, dim=-1), dim=-2).real
+        return x
+
+
+# class FourierTransformLayer(nn.Module):
+#     def forward(self, x):
+#         return torch.fft.fftn(x).real
+
+
+class FViTBlock(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            init_values: Optional[float] = None,
+            drop_path: float = 0.,
+            act_layer: nn.Module = nn.GELU,
+            norm_layer: nn.Module = nn.LayerNorm,
+            mlp_layer: nn.Module = Mlp,
+    ) -> None:
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = FNetBlock(
+
+
+        )
+        # self.attn = Attention(
+        #     dim,
+        #     num_heads=num_heads,
+        #     qkv_bias=qkv_bias,
+        #     qk_norm=qk_norm,
+        #     attn_drop=attn_drop,
+        #     proj_drop=proj_drop,
+        #     norm_layer=norm_layer,
+        # )
+        self.ls1 = LayerScale(
+            dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        self.mlp = mlp_layer(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+        )
+        self.ls2 = LayerScale(
+            dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        return x
+
+
+class FViTRunner(pl.LightningModule):
+    def __init__(self, hparams):
+        super().__init__()
+        self.model = vision_transformer.VisionTransformer(
+            img_size=hparams.img_size,
+            patch_size=hparams.patch_size,
+            in_chans=1,
+            num_classes=hparams.n_outputs,
+            qkv_bias=False,
+            block_fn=FViTBlock
+        )
+
+        # log params
+
+        self.save_hyperparameters()
+        self.learning_rate = hparams.learning_rate
+        self.accuracy = Accuracy(
+            task='multiclass', num_classes=hparams.n_outputs)
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self.forward(x)
+        loss = torch.nn.functional.cross_entropy(logits, y)
+
+        # training metrics
+        preds = torch.argmax(logits, dim=1)
+        acc = self.accuracy(preds, y)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, logger=True)
+        self.log('train_acc', acc, on_step=True, on_epoch=True, logger=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = torch.nn.functional.cross_entropy(logits, y)
+
+        # validation metrics
+        preds = torch.argmax(logits, dim=1)
+        acc = self.accuracy(preds, y)
+        self.log('val_loss', loss, on_step=True, on_epoch=False, prog_bar=True)
+        self.log('val_acc', acc, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    # def test_step(self, batch, batch_idx):
+    #     x, y = batch
+    #     logits = self(x)
+
+    #     # testing metrics
+    #     loss = torch.nn.functional.cross_entropy(logits, y)
+    #     preds = torch.argmax(logits, dim=1)
+    #     acc = self.accuracy(preds, y)
+    #     self.log('test_loss', loss, prog_bar=True)
+    #     self.log('test_acc', acc, prog_bar=True)
+
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        return optimizer
+
+
+class SpeechCommandsDataset(Dataset):
+    def __init__(self, directory, label_csv):
+        self.directory = directory
+        self.filepaths = list(os.path.join(directory, f)
+                              for f in os.listdir(directory) if f.endswith('.wav'))
+        self.label_to_idx = self.load_label_mapping(label_csv)
+
+    def load_label_mapping(self, label_csv):
+        df = pd.read_csv(label_csv)
+        label_to_idx = df.set_index('label')['idx'].to_dict()
+        # Get the index of the 'unknown' class
+        unknown_idx = label_to_idx['_unknown_']
+        # Create a default dictionary that returns the 'unknown' index for missing labels
+        label_to_idx = collections.defaultdict(
+            lambda: unknown_idx, label_to_idx)
+        return label_to_idx
+
+    def __len__(self):
+        return len(self.filepaths)
+
+    def __getitem__(self, idx):
+        filepath = self.filepaths[idx]
+        data, _ = librosa.load(filepath, sr=None)
+        data = librosa.stft(data)
+        data = torch.tensor(np.abs(data))
+        data = torch.unsqueeze(data, 0)
+        label = self.get_label_from_filepath(filepath)
+        label = self.label_to_idx[label]
+        return data, label
+
+    @staticmethod
+    def get_label_from_filepath(filepath):
+        filename = os.path.basename(filepath)
+        label = filename.split('_')[0]
+        return label
+
+
+class Lightning_DM(pl.LightningDataModule):
+    def __init__(self, train_dir, val_dir, test_dir, label_path):
+        super().__init__()
+        self.train_dir = train_dir
+        self.val_dir = val_dir
+        self.test_dir = test_dir
+        self.label_path = label_path
+
+    def prepare_data(self):
+        pass
+
+    def setup(self, stage):
+        self.train_data = SpeechCommandsDataset(
+            self.train_dir, self.label_path)
+        self.val_data = SpeechCommandsDataset(self.val_dir, self.label_path)
+        self.test_data = SpeechCommandsDataset(self.test_dir, self.label_path)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_data)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_data)
+    # def test_dataloader(self):
+    #     test_split = Dataset(...)
+    #     return DataLoader(test_split)
+
+
+def main():
+    # various hyperparameters
+    logparams = {
+        'img_size': [1025, 94],
+        'patch_size': [73, 6],
+        'exp_name': 'Jakob Fourier Project Test',  # unique name for model and logs
+        # sampling rate
+        'sampling_rate': 48000,  # 16000 for SpeechCommands
+        'n_outputs': 34,  # 34 for SpeechCommands
+        'wandb_project': 'FourierViT',
+        'gpus': 1,  # number of gpus
+        'max_epochs': 1,  # number of times during training, where the whole dataset is traversed
+        'learning_rate': 1e-3,
+        'batch_size': 1,  # should be considered together with learning rate. decrease if using a small machine and getting memory errors
+        'n_workers': 4,  # set to 0 in windows when working with a windows on a small machine
+    }
+    hparams = Namespace(**logparams)
+
+    # define logger and model
+    wandb_logger = WandbLogger(
+        project=hparams.wandb_project,
+        log_model="all",
+        name=hparams.exp_name,
+        config=logparams
+    )
+
+    fvit_lightning = FViTRunner(hparams)
+    train_path = '/home/jagrole/AAU/8.Semester/Project/Code/Data/speech_commands-v0.0.2-5h/48000/train'
+    test_path = '/home/jagrole/AAU/8.Semester/Project/Code/Data/speech_commands-v0.0.2-5h/48000/test'
+    val_path = '/home/jagrole/AAU/8.Semester/Project/Code/Data/speech_commands-v0.0.2-5h/48000/valid'
+    label_path = '/home/jagrole/AAU/8.Semester/Project/Code/Data/speech_commands-v0.0.2-5h/labelvocabulary.csv'
+    datamodule = Lightning_DM(train_dir=train_path,
+                              test_dir=test_path, val_dir=val_path, label_path=label_path)
+
+# Define Trainer
+    trainer = pl.Trainer(
+        max_epochs=hparams.max_epochs,
+        accelerator="gpu",
+        devices="auto",
+        # logger=wandb_logger,
+    )
+    trainer.fit(
+        model=fvit_lightning,
+        datamodule=datamodule
+    )
+
+
+    # trainer.test(
+    #     model=FViTRunner(),
+    #     dataloaders=Lightning_DM()
+    # )
+    # wandb.finish()
+if __name__ == '__main__':
+    main()
