@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -24,64 +25,7 @@ from transformers import ViTImageProcessor
 # from audio_utils.common.feature_transforms import SpectrogramParser
 
 
-class FNetBlock(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        x = torch.fft.fft(torch.fft.fft(x, dim=-1), dim=-2).real
-        return x
-
-
-# class FourierTransformLayer(nn.Module):
-#     def forward(self, x):
-#         return torch.fft.fftn(x).real
-
-
-class FViTBlock(nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            init_values: Optional[float] = None,
-            drop_path: float = 0.,
-            act_layer: nn.Module = nn.GELU,
-            norm_layer: nn.Module = nn.LayerNorm,
-            mlp_layer: nn.Module = Mlp,
-    ) -> None:
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = FNetBlock(
-        )
-        self.ls1 = LayerScale(
-            dim, init_values=init_values) if init_values else nn.Identity()
-        self.drop_path1 = DropPath(
-            drop_path) if drop_path > 0. else nn.Identity()
-
-        self.norm2 = norm_layer(dim)
-        self.mlp = mlp_layer(
-            in_features=dim,
-            hidden_features=int(dim * mlp_ratio),
-            act_layer=act_layer,
-            drop=proj_drop,
-        )
-        self.ls2 = LayerScale(
-            dim, init_values=init_values) if init_values else nn.Identity()
-        self.drop_path2 = DropPath(
-            drop_path) if drop_path > 0. else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-        return x
-
-
-class FViTRunner(pl.LightningModule):
+class ViTRunner(pl.LightningModule):
     def __init__(self, hparams):
         super().__init__()
         self.model = vision_transformer.VisionTransformer(
@@ -91,9 +35,7 @@ class FViTRunner(pl.LightningModule):
             num_classes=hparams.n_outputs,
             depth = hparams.depth,
             num_heads = hparams.num_heads,
-            drop_rate= hparams.drop_rate,
-            qkv_bias=False,
-            block_fn=FViTBlock
+            drop_rate= hparams.drop_rate
         )
 
         # log params
@@ -144,8 +86,9 @@ class FViTRunner(pl.LightningModule):
         self.log('test_acc', acc, prog_bar=True)
 
         return loss
+
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=3e-2)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
         #warmup scheduler
         scheduler = OneCycleLR(optimizer, max_lr=self.learning_rate, total_steps = self.max_epochs*1711)
 
@@ -157,15 +100,14 @@ class FViTRunner(pl.LightningModule):
             }
         }
 
-
 class LogMelSpec(nn.Module):
     def __init__(
         self,
-        sr=22050, # 22050, 48000
-        n_mels=80, # 80, 120
-        n_fft=441, # 441, 1400
-        win_len=441, # 441, 1400
-        hop_len=220, # 220, 300
+        sr=48000, # 22050, 48000
+        n_mels=120, # 80, 120
+        n_fft=1400, # 441, 1400
+        win_len=1400, # 441, 1400
+        hop_len=300, # 220, 300
         f_min=50., 
         f_max=8000.,
         normalize=True,
@@ -221,14 +163,15 @@ class LogMelSpec(nn.Module):
         return x
 
 class SpeechCommandsDataset(Dataset):
-    def __init__(self, directory, label_csv, samplingrate):
+    def __init__(self, directory, label_csv):
         self.directory = directory
         self.filepaths = list(os.path.join(directory, f)
                             for f in os.listdir(directory) if f.endswith('.wav'))
         self.label_to_idx = self.load_label_mapping(label_csv)
-        self.freq_mask = torchaudio.transforms.FrequencyMasking(freq_mask_param=2)
-        self.time_mask = torchaudio.transforms.TimeMasking(time_mask_param=2)
-        self.sampling_rate = samplingrate
+        self.logmel = LogMelSpec()
+        self.freq_mask = torchaudio.transforms.FrequencyMasking(freq_mask_param=15)
+        self.time_mask = torchaudio.transforms.TimeMasking(time_mask_param=35)
+
     def load_label_mapping(self, label_csv):
         df = pd.read_csv(label_csv)
         label_to_idx = df.set_index('label')['idx'].to_dict()
@@ -244,13 +187,12 @@ class SpeechCommandsDataset(Dataset):
 
     def __getitem__(self, idx):
         filepath = self.filepaths[idx]
-        logmel = LogMelSpec()
         
-        data, sr = librosa.load(filepath, sr=self.sampling_rate)
+        data, sr = librosa.load(filepath, sr=48000)
         if sr == 0:
-            sr = self.sampling_rate
+            sr = 48000
         
-        data = logmel(data)
+        data = self.logmel(data)
         data = self.freq_mask(data)
         data = self.time_mask(data)
         data = data.squeeze(1)
@@ -264,8 +206,10 @@ class SpeechCommandsDataset(Dataset):
         label = filename.split('_')[0]
         return label
 
+    
+
 class Lightning_DM(pl.LightningDataModule):
-    def __init__(self, train_dir, val_dir, test_dir, label_path, batch_size, n_workers, sampling_rate):
+    def __init__(self, train_dir, val_dir, test_dir, label_path, batch_size, n_workers):
         super().__init__()
         self.train_dir = train_dir
         self.val_dir = val_dir
@@ -273,15 +217,14 @@ class Lightning_DM(pl.LightningDataModule):
         self.label_path = label_path
         self.batch_size = batch_size
         self.n_workers = n_workers
-        self.sampling_rate = sampling_rate
 
     def prepare_data(self):
         pass
-
+    
     def setup(self, stage):
-        self.train_data = SpeechCommandsDataset(self.train_dir, self.label_path, self.sampling_rate)
-        self.val_data = SpeechCommandsDataset(self.val_dir, self.label_path, self.sampling_rate)
-        self.test_data = SpeechCommandsDataset(self.test_dir, self.label_path, self.sampling_rate)
+        self.train_data = SpeechCommandsDataset(self.train_dir, self.label_path)
+        self.val_data = SpeechCommandsDataset(self.val_dir, self.label_path)
+        self.test_data = SpeechCommandsDataset(self.test_dir, self.label_path)
 
     def train_dataloader(self):
         return DataLoader(self.train_data, batch_size = self.batch_size, num_workers = self.n_workers)
@@ -296,22 +239,21 @@ class Lightning_DM(pl.LightningDataModule):
 def main():
     wandb.init()
     # various hyperparameters
-
     logparams = {
-        'img_size': [101,80], # [101,80] [161, 140]
+        'img_size': [161, 120], # [101,80] [161, 140]
         'patch_size': [20, 2], # [20, 2], [40, 1]
         'exp_name': 'Jakob ViT Run', 
-        'sampling_rate': 22050,  # 22050, 48000 for SpeechCommands
+        'sampling_rate': 48000,  # 22050, 48000 for SpeechCommands
         'n_outputs': 12,  # 12, 35 for SpeechCommands
         'wandb_project': 'ViT',
         'gpus': 1,  
-        'max_epochs': 50,  
-        'learning_rate': 1e-2,
+        'max_epochs': 35,  
+        'learning_rate': 1e-4,
         'batch_size': 50,  
         'n_workers': 9,  
         'depth': 12,
         'num_heads': 12,
-        'drop_rate': 0.1,
+        'drop_rate': 0.4,
     }
     hparams = Namespace(**logparams)
 
@@ -323,11 +265,18 @@ def main():
         config=logparams
     )
 
-    fvit_lightning = FViTRunner(hparams)
+    fvit_lightning = ViTRunner(hparams)
+
     train_path = '/home/student.aau.dk/jogo18/Speech_Commands/train/'
     test_path =  '/home/student.aau.dk/jogo18/Speech_Commands/test/'
     val_path = '/home/student.aau.dk/jogo18/Speech_Commands/valid/'
     label_path = '/home/student.aau.dk/jogo18/Speech_Commands/labelvocabulary.csv'
+
+    # train_path = '/home/jagrole/AAU/8.Sem/Project/Code/Data/Speech_Commands/train'
+    # val_path = '/home/jagrole/AAU/8.Sem/Project/Code/Data/Speech_Commands/valid'
+    # test_path = '/home/jagrole/AAU/8.Sem/Project/Code/Data/Speech_Commands/test'
+    # label_path = '/home/jagrole/AAU/8.Sem/Project/Code/Data/Speech_Commands/labelvocabulary.csv'
+
 
     datamodule = Lightning_DM(
         train_dir=train_path,
@@ -335,8 +284,7 @@ def main():
         val_dir=val_path, 
         label_path=label_path,
         batch_size = hparams.batch_size,
-        n_workers = hparams.n_workers,
-        sampling_rate = hparams.sampling_rate
+        n_workers = hparams.n_workers
         )
 
 # Define Trainer
@@ -345,8 +293,7 @@ def main():
         accelerator="gpu",
         devices="auto",
         logger=wandb_logger,
-        # callbacks= [pl.callbacks.EarlyStopping(monitor="val_loss", mode="min")]
-    )
+        )
     trainer.fit(
         model=fvit_lightning,
         datamodule=datamodule
